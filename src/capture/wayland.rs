@@ -42,12 +42,14 @@ struct WaylandCaptureInner {
     height: u32,
     rx: mpsc::Receiver<CaptureFrame>,
     _pw_thread: pw_stream::PwThread,
+    _runtime: tokio::runtime::Runtime,
 }
 
 #[cfg(feature = "wayland")]
 impl WaylandCapture {
     pub fn new() -> Option<Self> {
-        let info = portal::open_session()?;
+        let rt = tokio::runtime::Runtime::new().ok()?;
+        let info = portal::open_session(&rt)?;
         let (tx, rx) = mpsc::channel();
         let pw_thread = pw_stream::PwThread::start(info, tx).ok()?;
         Some(WaylandCapture {
@@ -56,6 +58,7 @@ impl WaylandCapture {
                 height: pw_thread.height,
                 rx,
                 _pw_thread: pw_thread,
+                _runtime: rt,
             },
         })
     }
@@ -94,8 +97,7 @@ mod portal {
         pub height: u32,
     }
 
-    pub fn open_session() -> Option<StreamInfo> {
-        let rt = tokio::runtime::Runtime::new().ok()?;
+    pub fn open_session(rt: &tokio::runtime::Runtime) -> Option<StreamInfo> {
         rt.block_on(async {
             let proxy = Screencast::new().await.ok()?;
 
