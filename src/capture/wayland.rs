@@ -37,46 +37,17 @@ impl Capture for WaylandCapture {
 use std::sync::mpsc;
 
 #[cfg(feature = "wayland")]
-use std::sync::Arc;
-
-#[cfg(feature = "wayland")]
 struct WaylandCaptureInner {
     width: u32,
     height: u32,
     rx: mpsc::Receiver<CaptureFrame>,
     _pw_thread: pw_stream::PwThread,
-    _rt: Arc<tokio::runtime::Runtime>,
-    _rt_thread: Option<std::thread::JoinHandle<()>>,
-    _rt_stop: std::sync::mpsc::Sender<()>,
-}
-
-#[cfg(feature = "wayland")]
-impl Drop for WaylandCaptureInner {
-    fn drop(&mut self) {
-        // Signal the background thread to stop so we can drop the Runtime
-        let _ = self._rt_stop.send(());
-        if let Some(handle) = self._rt_thread.take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 #[cfg(feature = "wayland")]
 impl WaylandCapture {
     pub fn new() -> Option<Self> {
-        let rt = Arc::new(tokio::runtime::Runtime::new().ok()?);
-        let info = portal::open_session(&rt)?;
-
-        // Keep the runtime entered on a background thread so zbus's
-        // background tasks always have a live reactor.
-        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
-        let rt_clone = rt.clone();
-        let rt_thread = std::thread::spawn(move || {
-            rt_clone.block_on(async {
-                let _ = tokio::task::spawn_blocking(move || stop_rx.recv()).await;
-            });
-        });
-
+        let info = portal::open_session()?;
         let (tx, rx) = mpsc::channel();
         let pw_thread = pw_stream::PwThread::start(info, tx).ok()?;
         Some(WaylandCapture {
@@ -85,9 +56,6 @@ impl WaylandCapture {
                 height: pw_thread.height,
                 rx,
                 _pw_thread: pw_thread,
-                _rt: rt,
-                _rt_thread: Some(rt_thread),
-                _rt_stop: stop_tx,
             },
         })
     }
@@ -126,8 +94,8 @@ mod portal {
         pub height: u32,
     }
 
-    pub fn open_session(rt: &tokio::runtime::Runtime) -> Option<StreamInfo> {
-        rt.block_on(async {
+    pub fn open_session() -> Option<StreamInfo> {
+        async_io::block_on(async {
             let proxy = Screencast::new().await.ok()?;
 
             let session = proxy
