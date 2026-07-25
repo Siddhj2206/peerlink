@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
+wgpu = "29"
+iroh = { version = "1", default-features = false, features = ["portmapper", "tls-aws-lc-rs"] }
+iroh-gossip = "0.101"
+iroh-tickets = "1"
+postcard = { version = "1", features = ["alloc"] }
+sha2 = "0.11"
+serde = { version = "1", features = ["derive"] }
+rand = "0.10"
+pollster = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
