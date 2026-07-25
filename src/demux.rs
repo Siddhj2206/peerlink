@@ -1,12 +1,13 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use shiguredo_mp4::demux::{Input, Mp4FileDemuxer};
 use shiguredo_mp4::TrackKind;
 
 #[derive(Debug, Clone)]
-pub struct VideoFrame {
-    pub data: Vec<u8>,
+pub struct FrameEntry {
+    pub offset: u64,
+    pub size: u32,
     pub timestamp: Duration,
     pub is_keyframe: bool,
     pub track_id: u32,
@@ -19,6 +20,13 @@ pub struct VideoInfo {
     pub duration: Duration,
     pub frame_count: usize,
     pub track_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Mp4Index {
+    pub info: VideoInfo,
+    pub frames: Vec<FrameEntry>,
+    pub path: PathBuf,
 }
 
 #[derive(Debug)]
@@ -52,21 +60,24 @@ impl From<shiguredo_mp4::demux::DemuxError> for DemuxError {
     }
 }
 
-pub fn demux_file(path: &Path) -> Result<(VideoInfo, Vec<VideoFrame>), DemuxError> {
-    let file_data = std::fs::read(path)?;
-    let file_len = file_data.len() as u64;
+pub fn demux_file(path: &Path) -> Result<Mp4Index, DemuxError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
 
     let mut demuxer = Mp4FileDemuxer::new();
+    let mut buf = Vec::new();
 
     while let Some(required) = demuxer.required_input() {
         let size = required.size.unwrap_or((file_len - required.position) as usize);
-        let end = (required.position + size as u64).min(file_len);
-        let data = &file_data[required.position as usize..end as usize];
-        let input = Input {
+        buf.resize(size, 0u8);
+        file.seek(SeekFrom::Start(required.position))?;
+        file.read_exact(&mut buf)?;
+        demuxer.handle_input(Input {
             position: required.position,
-            data,
-        };
-        demuxer.handle_input(input);
+            data: &buf,
+        });
     }
 
     let tracks = demuxer.tracks()?;
@@ -78,7 +89,7 @@ pub fn demux_file(path: &Path) -> Result<(VideoInfo, Vec<VideoFrame>), DemuxErro
 
     let video_track_id = video_track.track_id;
     let timescale = video_track.timescale.get() as f64;
-    let duration_secs = if timescale > 0.0 {
+    let duration = if timescale > 0.0 {
         Duration::from_secs_f64(video_track.duration as f64 / timescale)
     } else {
         Duration::ZERO
@@ -110,11 +121,9 @@ pub fn demux_file(path: &Path) -> Result<(VideoInfo, Vec<VideoFrame>), DemuxErro
                     Duration::ZERO
                 };
 
-                let end = (sample.data_offset + sample.data_size as u64).min(file_len);
-                let data = file_data[sample.data_offset as usize..end as usize].to_vec();
-
-                frames.push(VideoFrame {
-                    data,
+                frames.push(FrameEntry {
+                    offset: sample.data_offset,
+                    size: sample.data_size as u32,
                     timestamp,
                     is_keyframe: sample.keyframe,
                     track_id: sample.track.track_id,
@@ -128,15 +137,31 @@ pub fn demux_file(path: &Path) -> Result<(VideoInfo, Vec<VideoFrame>), DemuxErro
     let info = VideoInfo {
         width,
         height,
-        duration: duration_secs,
+        duration,
         frame_count: frames.len(),
         track_count,
     };
 
-    Ok((info, frames))
+    Ok(Mp4Index {
+        info,
+        frames,
+        path: path.to_path_buf(),
+    })
 }
 
-pub fn seek_to_keyframe(frames: &[VideoFrame], target: Duration) -> usize {
+#[allow(dead_code)]
+pub fn read_frame_data(index: &Mp4Index, frame_index: usize) -> Result<Vec<u8>, DemuxError> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let entry = &index.frames[frame_index];
+    let mut file = std::fs::File::open(&index.path)?;
+    file.seek(SeekFrom::Start(entry.offset))?;
+    let mut buf = vec![0u8; entry.size as usize];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+pub fn seek_to_keyframe(frames: &[FrameEntry], target: Duration) -> usize {
     if frames.is_empty() {
         return 0;
     }
@@ -150,6 +175,7 @@ pub fn seek_to_keyframe(frames: &[VideoFrame], target: Duration) -> usize {
             break;
         }
     }
+
     let last = frames.len() - 1;
     if best == 0 && !frames[0].is_keyframe && target > frames[last].timestamp {
         let mut last_kf = 0;
@@ -167,10 +193,11 @@ pub fn seek_to_keyframe(frames: &[VideoFrame], target: Duration) -> usize {
 mod tests {
     use super::*;
 
-    fn sample_frame(timestamp_secs: f64, is_keyframe: bool) -> VideoFrame {
+    fn sample_entry(timestamp_secs: f64, is_keyframe: bool) -> FrameEntry {
         let timestamp = Duration::from_secs_f64(timestamp_secs);
-        VideoFrame {
-            data: vec![],
+        FrameEntry {
+            offset: 0,
+            size: 0,
             timestamp,
             is_keyframe,
             track_id: 1,
@@ -180,10 +207,10 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_exact() {
         let frames = vec![
-            sample_frame(0.0, true),
-            sample_frame(1.0, false),
-            sample_frame(2.0, true),
-            sample_frame(3.0, false),
+            sample_entry(0.0, true),
+            sample_entry(1.0, false),
+            sample_entry(2.0, true),
+            sample_entry(3.0, false),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(2.0)), 2);
     }
@@ -191,8 +218,8 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_before_first() {
         let frames = vec![
-            sample_frame(1.0, true),
-            sample_frame(2.0, false),
+            sample_entry(1.0, true),
+            sample_entry(2.0, false),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(0.0)), 0);
     }
@@ -200,9 +227,9 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_after_last() {
         let frames = vec![
-            sample_frame(0.0, true),
-            sample_frame(1.0, false),
-            sample_frame(2.0, true),
+            sample_entry(0.0, true),
+            sample_entry(1.0, false),
+            sample_entry(2.0, true),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(5.0)), 2);
     }
@@ -210,11 +237,11 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_between_keyframes() {
         let frames = vec![
-            sample_frame(0.0, true),
-            sample_frame(1.0, false),
-            sample_frame(2.0, false),
-            sample_frame(3.0, true),
-            sample_frame(4.0, false),
+            sample_entry(0.0, true),
+            sample_entry(1.0, false),
+            sample_entry(2.0, false),
+            sample_entry(3.0, true),
+            sample_entry(4.0, false),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(2.5)), 0);
     }
@@ -228,11 +255,11 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_midpoint() {
         let frames = vec![
-            sample_frame(0.0, false),
-            sample_frame(1.0, true),
-            sample_frame(2.0, false),
-            sample_frame(3.0, true),
-            sample_frame(4.0, false),
+            sample_entry(0.0, false),
+            sample_entry(1.0, true),
+            sample_entry(2.0, false),
+            sample_entry(3.0, true),
+            sample_entry(4.0, false),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(2.0)), 1);
     }
@@ -240,9 +267,9 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_after_last_no_keyframe_at_end() {
         let frames = vec![
-            sample_frame(0.0, true),
-            sample_frame(1.0, false),
-            sample_frame(2.0, false),
+            sample_entry(0.0, true),
+            sample_entry(1.0, false),
+            sample_entry(2.0, false),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(5.0)), 0);
     }
@@ -250,35 +277,38 @@ mod tests {
     #[test]
     fn test_seek_to_keyframe_all_keyframes() {
         let frames = vec![
-            sample_frame(0.0, true),
-            sample_frame(1.0, true),
-            sample_frame(2.0, true),
+            sample_entry(0.0, true),
+            sample_entry(1.0, true),
+            sample_entry(2.0, true),
         ];
         assert_eq!(seek_to_keyframe(&frames, Duration::from_secs_f64(1.5)), 1);
     }
 
     #[test]
-    fn test_video_frame_construction() {
-        let frame = VideoFrame {
-            data: vec![0u8; 10],
+    fn test_frame_entry_construction() {
+        let entry = FrameEntry {
+            offset: 1234,
+            size: 5678,
             timestamp: Duration::from_secs_f64(5.0),
             is_keyframe: true,
             track_id: 1,
         };
-        assert_eq!(frame.data.len(), 10);
-        assert_eq!(frame.timestamp, Duration::from_secs_f64(5.0));
-        assert!(frame.is_keyframe);
+        assert_eq!(entry.offset, 1234);
+        assert_eq!(entry.size, 5678);
+        assert_eq!(entry.timestamp, Duration::from_secs_f64(5.0));
+        assert!(entry.is_keyframe);
     }
 
     #[test]
-    fn test_video_frame_non_keyframe() {
-        let frame = VideoFrame {
-            data: vec![],
+    fn test_frame_entry_non_keyframe() {
+        let entry = FrameEntry {
+            offset: 0,
+            size: 0,
             timestamp: Duration::ZERO,
             is_keyframe: false,
             track_id: 1,
         };
-        assert!(!frame.is_keyframe);
+        assert!(!entry.is_keyframe);
     }
 
     #[test]
