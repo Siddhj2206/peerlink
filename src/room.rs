@@ -1,8 +1,9 @@
 use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RoomState {
+    #[default]
     Idle,
     Hosting {
         room_code: String,
@@ -23,11 +24,6 @@ pub enum RoomState {
     },
 }
 
-impl Default for RoomState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
 
 impl RoomState {
     pub fn is_idle(&self) -> bool {

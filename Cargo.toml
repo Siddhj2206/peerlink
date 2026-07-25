@@ -20,3 +20,5 @@ anyhow = "1"
 iroh-docs = { version = "0.101.0", default-features = false }
 hex = "0.4.3"
 tokio = "1.53.1"
+shiguredo_mp4 = "2026.3.0"
+rfd = "0.17.2"

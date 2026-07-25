@@ -1,6 +1,7 @@
 mod app;
 mod chat;
 mod codec;
+mod demux;
 mod net;
 mod room;
 mod ticket;
