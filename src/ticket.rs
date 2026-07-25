@@ -1,3 +1,4 @@
+use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
@@ -6,18 +7,24 @@ use serde::{Deserialize, Serialize};
 pub struct PartyTicket {
     version: u8,
     topic_id: [u8; 32],
+    namespace_id: [u8; 32],
 }
 
 impl PartyTicket {
-    pub fn new(topic_id: TopicId) -> Self {
+    pub fn new(topic_id: TopicId, namespace_id: NamespaceId) -> Self {
         Self {
             version: 0,
             topic_id: *topic_id.as_bytes(),
+            namespace_id: namespace_id.to_bytes(),
         }
     }
 
     pub fn topic_id(&self) -> TopicId {
         TopicId::from_bytes(self.topic_id)
+    }
+
+    pub fn namespace_id(&self) -> NamespaceId {
+        NamespaceId::from(&self.namespace_id)
     }
 
     pub fn parse(s: &str) -> Result<Self, ParseError> {
@@ -53,20 +60,31 @@ mod tests {
         ])
     }
 
+    fn test_namespace_id() -> NamespaceId {
+        NamespaceId::from(&[
+            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2,
+            0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5, 0xe4,
+            0xe3, 0xe2, 0xe1, 0xe0,
+        ])
+    }
+
     #[test]
     fn test_party_ticket_round_trip_bytes() {
         let topic_id = test_topic_id();
-        let ticket = PartyTicket::new(topic_id);
+        let ns_id = test_namespace_id();
+        let ticket = PartyTicket::new(topic_id, ns_id);
         let bytes = ticket.encode_bytes();
         let decoded = PartyTicket::decode_bytes(&bytes).unwrap();
         assert_eq!(ticket, decoded);
         assert_eq!(decoded.topic_id(), topic_id);
+        assert_eq!(decoded.namespace_id(), ns_id);
     }
 
     #[test]
     fn test_party_ticket_round_trip_string() {
         let topic_id = test_topic_id();
-        let ticket = PartyTicket::new(topic_id);
+        let ns_id = test_namespace_id();
+        let ticket = PartyTicket::new(topic_id, ns_id);
         let s = ticket.encode_string();
         assert!(s.starts_with("party"), "string should start with 'party', got: {s}");
         let decoded = PartyTicket::decode_string(&s).unwrap();
@@ -76,10 +94,12 @@ mod tests {
     #[test]
     fn test_party_ticket_parse() {
         let topic_id = test_topic_id();
-        let ticket = PartyTicket::new(topic_id);
+        let ns_id = test_namespace_id();
+        let ticket = PartyTicket::new(topic_id, ns_id);
         let s = ticket.to_string_encoded();
         let parsed = PartyTicket::parse(&s).unwrap();
         assert_eq!(parsed.topic_id(), topic_id);
+        assert_eq!(parsed.namespace_id(), ns_id);
     }
 
     #[test]
@@ -103,8 +123,9 @@ mod tests {
     #[test]
     fn test_deterministic_encoding() {
         let topic_id = test_topic_id();
-        let ticket1 = PartyTicket::new(topic_id);
-        let ticket2 = PartyTicket::new(topic_id);
+        let ns_id = test_namespace_id();
+        let ticket1 = PartyTicket::new(topic_id, ns_id);
+        let ticket2 = PartyTicket::new(topic_id, ns_id);
         assert_eq!(ticket1.encode_string(), ticket2.encode_string());
     }
 }

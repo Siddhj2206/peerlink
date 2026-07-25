@@ -1,3 +1,4 @@
+use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7,6 +8,7 @@ pub enum RoomState {
         room_code: String,
         ticket_string: String,
         topic_id: TopicId,
+        namespace_id: NamespaceId,
     },
     Joining {
         ticket_input: String,
@@ -14,6 +16,7 @@ pub enum RoomState {
     Joined {
         room_code: String,
         topic_id: TopicId,
+        namespace_id: NamespaceId,
     },
     Error {
         message: String,
@@ -63,11 +66,25 @@ impl RoomState {
         }
     }
 
-    pub fn start_hosting(room_code: String, ticket_string: String, topic_id: TopicId) -> Self {
+    pub fn namespace_id(&self) -> Option<NamespaceId> {
+        match self {
+            Self::Hosting { namespace_id, .. } => Some(*namespace_id),
+            Self::Joined { namespace_id, .. } => Some(*namespace_id),
+            _ => None,
+        }
+    }
+
+    pub fn start_hosting(
+        room_code: String,
+        ticket_string: String,
+        topic_id: TopicId,
+        namespace_id: NamespaceId,
+    ) -> Self {
         Self::Hosting {
             room_code,
             ticket_string,
             topic_id,
+            namespace_id,
         }
     }
 
@@ -75,9 +92,13 @@ impl RoomState {
         Self::Joining { ticket_input }
     }
 
-    pub fn join(self, room_code: String, topic_id: TopicId) -> Self {
+    pub fn join(self, room_code: String, topic_id: TopicId, namespace_id: NamespaceId) -> Self {
         match self {
-            Self::Joining { .. } => Self::Joined { room_code, topic_id },
+            Self::Joining { .. } => Self::Joined {
+                room_code,
+                topic_id,
+                namespace_id,
+            },
             other => other,
         }
     }
@@ -113,6 +134,14 @@ mod tests {
         ])
     }
 
+    fn test_namespace_id() -> NamespaceId {
+        NamespaceId::from(&[
+            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2,
+            0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5, 0xe4,
+            0xe3, 0xe2, 0xe1, 0xe0,
+        ])
+    }
+
     #[test]
     fn test_idle_is_default() {
         let state = RoomState::default();
@@ -124,14 +153,17 @@ mod tests {
     #[test]
     fn test_start_hosting_transition() {
         let topic_id = test_topic_id();
+        let ns_id = test_namespace_id();
         let state = RoomState::start_hosting(
             "alpha bravo charlie delta echo foxtrot".into(),
             "partyabc123".into(),
             topic_id,
+            ns_id,
         );
         assert!(state.is_hosting());
         assert_eq!(state.room_code(), Some("alpha bravo charlie delta echo foxtrot"));
         assert_eq!(state.topic_id(), Some(topic_id));
+        assert_eq!(state.namespace_id(), Some(ns_id));
     }
 
     #[test]
@@ -143,16 +175,17 @@ mod tests {
     #[test]
     fn test_join_transition_from_joining() {
         let state = RoomState::start_joining("partyabc123".into());
-        let state = state.join("room code".into(), test_topic_id());
+        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
         assert!(state.is_joined());
         assert_eq!(state.room_code(), Some("room code"));
         assert_eq!(state.topic_id(), Some(test_topic_id()));
+        assert_eq!(state.namespace_id(), Some(test_namespace_id()));
     }
 
     #[test]
     fn test_join_from_non_joining_is_noop() {
         let state = RoomState::Idle;
-        let state = state.join("room code".into(), test_topic_id());
+        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
         assert!(state.is_idle());
     }
 
@@ -162,6 +195,7 @@ mod tests {
             "room code".into(),
             "partyabc".into(),
             test_topic_id(),
+            test_namespace_id(),
         );
         let state = state.leave();
         assert!(state.is_idle());
@@ -170,7 +204,7 @@ mod tests {
     #[test]
     fn test_leave_joined_returns_to_idle() {
         let state = RoomState::start_joining("ticket".into());
-        let state = state.join("room code".into(), test_topic_id());
+        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
         let state = state.leave();
         assert!(state.is_idle());
     }
@@ -208,6 +242,7 @@ mod tests {
             "code".into(),
             "ticket".into(),
             test_topic_id(),
+            test_namespace_id(),
         );
         let state = state.dismiss_error();
         assert!(state.is_hosting());
@@ -235,7 +270,38 @@ mod tests {
     #[test]
     fn test_joining_state_not_merged() {
         let state = RoomState::start_joining("partyxyz".into());
-        // Joining doesn't have room_code yet
         assert_eq!(state.room_code(), None);
+    }
+
+    #[test]
+    fn test_namespace_id_none_for_idle() {
+        let state = RoomState::Idle;
+        assert_eq!(state.namespace_id(), None);
+    }
+
+    #[test]
+    fn test_namespace_id_none_for_error() {
+        let state = RoomState::fail("error".into());
+        assert_eq!(state.namespace_id(), None);
+    }
+
+    #[test]
+    fn test_namespace_id_available_in_hosting() {
+        let ns_id = test_namespace_id();
+        let state = RoomState::start_hosting(
+            "code".into(),
+            "ticket".into(),
+            test_topic_id(),
+            ns_id,
+        );
+        assert_eq!(state.namespace_id(), Some(ns_id));
+    }
+
+    #[test]
+    fn test_namespace_id_available_in_joined() {
+        let ns_id = test_namespace_id();
+        let state = RoomState::start_joining("ticket".into());
+        let state = state.join("code".into(), test_topic_id(), ns_id);
+        assert_eq!(state.namespace_id(), Some(ns_id));
     }
 }

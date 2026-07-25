@@ -1,6 +1,11 @@
 use eframe::egui::{self, Frame, OutputCommand, Panel, RichText, Vec2};
 
-use crate::{codec, room::RoomState, ticket::PartyTicket};
+use crate::{
+    chat::{ChatEngine, ChatMessage, LocalChatEngine},
+    codec,
+    room::RoomState,
+    ticket::PartyTicket,
+};
 
 const APP_NAME: &str = "PeerLink";
 const MIN_CHAT_WIDTH: f32 = 150.0;
@@ -12,7 +17,8 @@ pub struct PeerLinkApp {
     ticket_input: String,
     room_code: String,
     chat_input: String,
-    chat_messages: Vec<String>,
+    chat_engine: LocalChatEngine,
+    chat_messages: Vec<ChatMessage>,
 }
 
 impl Default for PeerLinkApp {
@@ -23,6 +29,7 @@ impl Default for PeerLinkApp {
             ticket_input: String::new(),
             room_code: String::new(),
             chat_input: String::new(),
+            chat_engine: LocalChatEngine::new("You".into()),
             chat_messages: Vec::new(),
         }
     }
@@ -129,6 +136,8 @@ impl PeerLinkApp {
     }
 
     fn render_player(&mut self, ui: &mut egui::Ui) {
+        self.poll_chat();
+
         Panel::top("player_top").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if ui.button("← Leave").clicked() {
@@ -199,6 +208,16 @@ impl PeerLinkApp {
         });
     }
 
+    fn reset_chat(&mut self) {
+        self.chat_engine = LocalChatEngine::new("You".into());
+        self.chat_messages.clear();
+    }
+
+    fn poll_chat(&mut self) {
+        let msgs = self.chat_engine.drain_messages();
+        self.chat_messages.extend(msgs);
+    }
+
     fn render_video_area(&mut self, ui: &mut egui::Ui) {
         let code = self.state.room_code().unwrap_or("unknown").to_string();
         let label = format!("Video stream for room: {code}");
@@ -225,7 +244,8 @@ impl PeerLinkApp {
                     ui.label("No messages yet.");
                 } else {
                     for msg in &self.chat_messages {
-                        ui.label(msg);
+                        let line = format!("{}: {}", msg.author, msg.content);
+                        ui.label(line);
                     }
                 }
             });
@@ -241,9 +261,9 @@ impl PeerLinkApp {
                 let enter_pressed = input_resp.lost_focus()
                     && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if send_clicked || enter_pressed {
-                    let msg = self.chat_input.trim().to_string();
-                    if !msg.is_empty() {
-                        self.chat_messages.push(format!("You: {msg}"));
+                    let content = self.chat_input.trim().to_string();
+                    if !content.is_empty() {
+                        self.chat_engine.send(content);
                         self.chat_input.clear();
                     }
                 }
@@ -254,11 +274,13 @@ impl PeerLinkApp {
     fn create_room(&mut self) {
         let room_code = codec::generate_room_code();
         let topic_id = codec::words_to_topic_id(&room_code);
-        let ticket = PartyTicket::new(topic_id);
+        let namespace_id = iroh_docs::NamespaceId::from(&rand::random::<[u8; 32]>());
+        let ticket = PartyTicket::new(topic_id, namespace_id);
         let ticket_string = ticket.to_string_encoded();
 
         self.room_code = room_code.clone();
-        self.state = RoomState::start_hosting(room_code, ticket_string, topic_id);
+        self.reset_chat();
+        self.state = RoomState::start_hosting(room_code, ticket_string, topic_id, namespace_id);
     }
 
     fn join_room(&mut self) {
@@ -270,8 +292,10 @@ impl PeerLinkApp {
         match PartyTicket::parse(&ticket_str) {
             Ok(ticket) => {
                 let topic_id = ticket.topic_id();
+                let namespace_id = ticket.namespace_id();
                 let state = std::mem::replace(&mut self.state, RoomState::Idle);
-                self.state = state.join(ticket_str.clone(), topic_id);
+                self.reset_chat();
+                self.state = state.join(ticket_str.clone(), topic_id, namespace_id);
                 self.room_code = ticket_str.clone();
             }
             Err(e) => {

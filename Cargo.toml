@@ -17,3 +17,6 @@ pollster = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+iroh-docs = { version = "0.101.0", default-features = false }
+hex = "0.4.3"
+tokio = "1.53.1"
