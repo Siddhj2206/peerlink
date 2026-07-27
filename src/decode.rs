@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -142,6 +143,7 @@ pub struct StreamingDecoder {
     decode_config: DecodeConfig,
     decoder: RustH264Decoder,
     pushed_to: Option<usize>,
+    cache: VecDeque<(usize, DecodedFrame)>,
     stats: DecodeStats,
 }
 
@@ -155,12 +157,17 @@ impl StreamingDecoder {
             decode_config,
             decoder,
             pushed_to: None,
+            cache: VecDeque::new(),
             stats: DecodeStats::default(),
         })
     }
 
     pub fn frame_count(&self) -> usize {
         self.index.frames.len()
+    }
+
+    fn index_for_timestamp(&self, ts: Duration) -> Option<usize> {
+        self.index.frames.iter().position(|f| f.timestamp == ts)
     }
 
     fn recreate_at_keyframe(&mut self, target: usize) -> Result<()> {
@@ -171,6 +178,7 @@ impl StreamingDecoder {
         };
         self.decoder = RustH264Decoder::new(&self.config, &self.decode_config)?;
         self.pushed_to = Some(kf);
+        self.cache.clear();
         Ok(())
     }
 
@@ -182,9 +190,14 @@ impl StreamingDecoder {
             );
         }
 
-        let is_sequential = self.pushed_to.map_or(target == 0, |p| p + 1 == target);
+        // Warm cache hit.
+        if let Some(pos) = self.cache.iter().position(|(idx, _)| *idx == target) {
+            return Ok(self.cache[pos].1.clone());
+        }
 
-        if !is_sequential {
+        // If we've already pushed past the target without caching it, seek
+        // back to the nearest keyframe and re-decode.
+        if self.pushed_to.map_or(false, |p| p > target) && self.cache.is_empty() {
             self.recreate_at_keyframe(target)?;
         }
 
@@ -192,12 +205,14 @@ impl StreamingDecoder {
             self.pushed_to = Some(0);
         }
 
-        let target_ts = self.index.frames[target].timestamp;
-
+        // Keep pushing frames and caching decoder output until we hit the
+        // target.  H.264 decoders have a look-ahead delay, so we may need to
+        // push extra frames before output appears.
         while let Some(p) = self.pushed_to {
-            if p > target {
+            if p >= self.index.frames.len() {
                 break;
             }
+
             let i = p;
             let entry = &self.index.frames[i];
             let data = read_frame_data(&self.index, i)?;
@@ -208,38 +223,61 @@ impl StreamingDecoder {
             self.decoder.push_packet(pkt)?;
             self.stats.record_decode(start.elapsed());
 
-            let mut output_frame: Option<DecodedFrame> = None;
+            let push_idx = i;
+            self.pushed_to = Some(push_idx + 1);
+
+            // Drain all output frames from the decoder into our cache.
+            let mut found_target = false;
             while let Some(vf) = self.decoder.pop_frame()? {
-                if vf.timestamp == target_ts || (i == target && output_frame.is_none()) {
+                if let Some(out_idx) = self.index_for_timestamp(vf.timestamp) {
                     let rgba = vf.rgba_image();
                     let pixels = (rgba.width() * rgba.height()) as u64;
                     self.stats.record_bytes(input_bytes, pixels);
-                    output_frame = Some(DecodedFrame {
+                    let frame = DecodedFrame {
                         data: rgba.as_raw().to_vec(),
                         width: rgba.width(),
                         height: rgba.height(),
                         timestamp: vf.timestamp,
-                    });
+                    };
+                    if out_idx == target {
+                        found_target = true;
+                    }
+                    if !self.cache.iter().any(|(idx, _)| *idx == out_idx) {
+                        self.cache.push_back((out_idx, frame));
+                    }
                 }
             }
 
-            self.pushed_to = Some(i + 1);
-
-            if let Some(frame) = output_frame {
-                return Ok(frame);
+            // If we just found the target in the drain, return from cache.
+            if found_target {
+                let pos = self
+                    .cache
+                    .iter()
+                    .position(|(idx, _)| *idx == target)
+                    .expect("just inserted");
+                return Ok(self.cache[pos].1.clone());
             }
         }
 
-        if let Some(vf) = self.decoder.pop_frame()? {
-            let rgba = vf.rgba_image();
-            let pixels = (rgba.width() * rgba.height()) as u64;
-            self.stats.record_bytes(0, pixels);
-            return Ok(DecodedFrame {
-                data: rgba.as_raw().to_vec(),
-                width: rgba.width(),
-                height: rgba.height(),
-                timestamp: vf.timestamp,
-            });
+        // Flush remaining buffered frames from the decoder.
+        while let Some(vf) = self.decoder.pop_frame()? {
+            if let Some(out_idx) = self.index_for_timestamp(vf.timestamp) {
+                let rgba = vf.rgba_image();
+                let pixels = (rgba.width() * rgba.height()) as u64;
+                self.stats.record_bytes(0, pixels);
+                let frame = DecodedFrame {
+                    data: rgba.as_raw().to_vec(),
+                    width: rgba.width(),
+                    height: rgba.height(),
+                    timestamp: vf.timestamp,
+                };
+                if out_idx == target {
+                    return Ok(frame);
+                }
+                if !self.cache.iter().any(|(idx, _)| *idx == out_idx) {
+                    self.cache.push_back((out_idx, frame));
+                }
+            }
         }
 
         anyhow::bail!("no decoded frame produced for index {target}")
