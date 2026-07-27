@@ -9,6 +9,7 @@ wgpu = "29"
 iroh = { version = "1", default-features = false, features = ["portmapper", "tls-aws-lc-rs"] }
 iroh-gossip = "0.101"
 iroh-tickets = "1"
+iroh-live = { git = "https://github.com/n0-computer/iroh-live.git", default-features = false, features = ["h264"] }
 postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.11"
 serde = { version = "1", features = ["derive"] }
@@ -17,8 +18,12 @@ pollster = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
-iroh-docs = { version = "0.101.0", default-features = false }
+iroh-docs = { version = "0.101.0", default-features = false, features = ["rpc"] }
 hex = "0.4.3"
 tokio = "1.53.1"
 shiguredo_mp4 = "2026.3.0"
+bytes = "1"
 rfd = "0.17.2"
+
+[dev-dependencies]
+tempfile = "3"
