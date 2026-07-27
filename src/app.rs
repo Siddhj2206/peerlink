@@ -5,6 +5,7 @@ use eframe::egui::{self, Frame, OutputCommand, Panel, RichText, Vec2};
 use crate::{
     chat::{ChatEngine, ChatMessage, LocalChatEngine},
     codec,
+    decode::{self, DecodedFrame, DecodeStats},
     demux::{self, Mp4Index},
     room::RoomState,
     ticket::PartyTicket,
@@ -29,6 +30,13 @@ pub struct PeerLinkApp {
     is_playing: bool,
     playback_started: Option<Instant>,
     elapsed: f64,
+
+    // decoded video frames
+    decoded_frames: Vec<DecodedFrame>,
+    decode_stats: Option<DecodeStats>,
+    video_texture: Option<egui::TextureHandle>,
+    current_texture_frame: usize,
+    show_stats: bool,
 }
 
 impl Default for PeerLinkApp {
@@ -47,6 +55,12 @@ impl Default for PeerLinkApp {
             is_playing: false,
             playback_started: None,
             elapsed: 0.0,
+
+            decoded_frames: Vec::new(),
+            decode_stats: None,
+            video_texture: None,
+            current_texture_frame: 0,
+            show_stats: false,
         }
     }
 }
@@ -277,12 +291,63 @@ impl PeerLinkApp {
             ui.label(format!("{pos} / {dur}"));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let has_decoded = !self.decoded_frames.is_empty();
+                if ui.selectable_label(has_decoded, "📊").clicked() {
+                    self.show_stats = !self.show_stats;
+                }
+
                 let chat_toggle =
                     egui::Button::new(if self.chat_visible { "Chat ▸" } else { "Chat ◂" });
                 if ui.add(chat_toggle).clicked() {
                     self.chat_visible = !self.chat_visible;
                 }
             });
+        });
+
+        if self.show_stats {
+            self.render_decode_stats(ui);
+        }
+    }
+
+    fn render_decode_stats(&mut self, ui: &mut egui::Ui) {
+        let Some(ref stats) = self.decode_stats else { return };
+        if stats.frames_decoded == 0 {
+            return;
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Decode:");
+            ui.label(format!("{} frames", stats.frames_decoded));
+            ui.label(format!(
+                "avg {:.1}ms",
+                stats.avg_decode_time.as_secs_f64() * 1000.0
+            ));
+            ui.label(format!(
+                "max {:.1}ms",
+                stats.max_decode_time.as_secs_f64() * 1000.0
+            ));
+            if stats.min_decode_time < Duration::MAX {
+                ui.label(format!(
+                    "min {:.1}ms",
+                    stats.min_decode_time.as_secs_f64() * 1000.0
+                ));
+            }
+            if stats.last_fps > 0.0 {
+                ui.label(format!("{:.0} fps (decode)", stats.last_fps));
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "Total decode: {:.1}s",
+                stats.total_decode_time.as_secs_f64()
+            ));
+            if !self.decoded_frames.is_empty() {
+                ui.label(format!(
+                    "Display: {}×{}",
+                    self.decoded_frames[0].width,
+                    self.decoded_frames[0].height
+                ));
+            }
         });
     }
 
@@ -297,41 +362,36 @@ impl PeerLinkApp {
     }
 
     fn render_video_area(&mut self, ui: &mut egui::Ui) {
-        if self.video_index.is_some() {
-            let current_frame = self.current_frame;
-            let is_playing = self.is_playing;
-            let index = self.video_index.as_ref().unwrap();
-            let frame = index.frames.get(current_frame);
+        self.sync_video_texture(ui);
+
+        if let Some(tex) = &self.video_texture {
+            let available = ui.available_size();
+            let tex_size = tex.size_vec2();
+            let scale = (available.x / tex_size.x)
+                .min(available.y / tex_size.y)
+                .min(1.0);
+            let display_size = egui::vec2(
+                (tex_size.x * scale).max(1.0),
+                (tex_size.y * scale).max(1.0),
+            );
+
+            let image = egui::Image::new(tex);
+            ui.add_sized(display_size, image);
+        } else if let Some(index) = &self.video_index {
             let file = index
                 .path
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
-            let dur = format_time(index.info.duration.as_secs_f64());
-            let kf_count = index.frames.iter().filter(|f| f.is_keyframe).count();
-            let frame_info = frame
-                .map(|f| {
-                    let ts = format_time(f.timestamp.as_secs_f64());
-                    let kf = if f.is_keyframe { " [K]" } else { "" };
-                    format!("Frame {}/{}, {ts}{kf}", current_frame + 1, index.info.frame_count)
-                })
-                .unwrap_or_default();
 
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
-                ui.label("🎥");
+                ui.label("🎥 (decoded frames pending)");
                 ui.add_space(4.0);
-                ui.label(format!("{file} — {dur}"));
+                ui.label(file);
                 ui.add_space(4.0);
-                ui.label(format!("{} frames ({} keyframes, {} tracks)", index.info.frame_count, kf_count, index.info.track_count));
                 if index.info.width > 0 {
                     ui.label(format!("{}×{}", index.info.width, index.info.height));
-                }
-                ui.add_space(4.0);
-                ui.label(frame_info);
-                if is_playing {
-                    ui.add_space(4.0);
-                    ui.label("▶ Playing");
                 }
             });
         } else if let RoomState::Hosting { .. } = &self.state {
@@ -339,6 +399,32 @@ impl PeerLinkApp {
         } else if self.state.room_code().is_some() {
             self.render_video_waiting(ui);
         }
+    }
+
+    fn sync_video_texture(&mut self, ui: &mut egui::Ui) {
+        if self.decoded_frames.is_empty() {
+            return;
+        }
+        let frame_idx = self.current_frame.min(self.decoded_frames.len() - 1);
+        if frame_idx == self.current_texture_frame && self.video_texture.is_some() {
+            return;
+        }
+        let frame = &self.decoded_frames[frame_idx];
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [frame.width as usize, frame.height as usize],
+            &frame.data,
+        );
+        match &mut self.video_texture {
+            Some(tex) => tex.set(color_image, Default::default()),
+            None => {
+                self.video_texture = Some(ui.ctx().load_texture(
+                    "video_frame",
+                    color_image,
+                    Default::default(),
+                ));
+            }
+        }
+        self.current_texture_frame = frame_idx;
     }
 
     fn render_video_prompt_host(&mut self, ui: &mut egui::Ui) {
@@ -430,7 +516,22 @@ impl PeerLinkApp {
         if let Some(path) = path {
             match demux::demux_file(&path) {
                 Ok(index) => {
+                    let config = decode::config_from_video_info(&index.info);
+                    let r = decode::decode_all_frames(&index, &config);
+                    match r {
+                        Ok((frames, stats)) => {
+                            self.decoded_frames = frames;
+                            self.decode_stats = Some(stats);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to decode frames: {e}");
+                            self.decoded_frames = Vec::new();
+                            self.decode_stats = None;
+                        }
+                    }
                     self.video_index = Some(index);
+                    self.video_texture = None;
+                    self.current_texture_frame = 0;
                     self.current_frame = 0;
                     self.is_playing = false;
                     self.playback_started = None;

@@ -4747,6 +4747,7 @@ dependencies = [
  "postcard",
  "rand",
  "rfd",
+ "rusty-codecs",
  "serde",
  "sha2",
  "shiguredo_mp4",

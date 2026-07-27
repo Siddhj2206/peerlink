@@ -1,6 +1,7 @@
 mod app;
 mod chat;
 mod codec;
+mod decode;
 mod demux;
 mod live;
 mod net;
