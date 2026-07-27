@@ -15,9 +15,9 @@ pub fn config_from_index(info: &VideoInfo) -> VideoConfig {
     VideoConfig {
         codec: VideoCodec::H264(H264 {
             inline: false,
-            profile: 0x42,
-            constraints: 0,
-            level: 0x1E,
+            profile: info.h264_profile,
+            constraints: info.h264_constraints,
+            level: info.h264_level,
         }),
         description: None,
         coded_width: Some(info.width as u32),
@@ -207,6 +207,9 @@ mod tests {
             duration: Duration::from_secs_f64(0.099),
             frame_count: frames.len(),
             track_count: 1,
+            h264_profile: 0x42,
+            h264_constraints: 0,
+            h264_level: 0x1E,
         };
 
         (Mp4Index { info, frames, path }, tmp)

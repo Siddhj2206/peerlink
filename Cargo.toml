@@ -28,3 +28,10 @@ rusty-codecs = { git = "https://github.com/n0-computer/iroh-live.git", default-f
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = "z"  # Optimize for size ("s" is an alternative, test both)
+lto = true       # Enable Link-Time Optimization
+codegen-units = 1 # Reduce parallel code generation units to increase optimization potential
+panic = "abort"  # Abort on panic to remove unwinding code
+strip = true     # Strip symbols from the binary (requires Rust 1.59+)

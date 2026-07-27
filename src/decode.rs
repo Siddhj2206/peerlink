@@ -6,15 +6,15 @@ use rusty_codecs::config::{VideoCodec, VideoConfig, H264};
 use rusty_codecs::format::{DecodeConfig, MediaPacket};
 use rusty_codecs::traits::VideoDecoder;
 
-use crate::demux::{read_frame_data, Mp4Index, VideoInfo};
+use crate::demux::{read_frame_data, seek_to_keyframe, Mp4Index, VideoInfo};
 
 pub fn config_from_video_info(info: &VideoInfo) -> VideoConfig {
     VideoConfig {
         codec: VideoCodec::H264(H264 {
             inline: false,
-            profile: 0x42,
-            constraints: 0,
-            level: 0x1E,
+            profile: info.h264_profile,
+            constraints: info.h264_constraints,
+            level: info.h264_level,
         }),
         description: None,
         coded_width: Some(info.width as u32),
@@ -45,6 +45,12 @@ pub struct DecodeStats {
     pub last_fps: f64,
     fps_start: Instant,
     fps_frames: u64,
+    pub total_input_bytes: u64,
+    pub total_decoded_pixels: u64,
+    pub display_latency: Duration,
+    pub display_latency_recorded: bool,
+    pub network_latency: Duration,
+    pub network_latency_recorded: bool,
 }
 
 impl Default for DecodeStats {
@@ -58,6 +64,12 @@ impl Default for DecodeStats {
             last_fps: 0.0,
             fps_start: Instant::now(),
             fps_frames: 0,
+            total_input_bytes: 0,
+            total_decoded_pixels: 0,
+            display_latency: Duration::ZERO,
+            display_latency_recorded: false,
+            network_latency: Duration::ZERO,
+            network_latency_recorded: false,
         }
     }
 }
@@ -80,61 +92,169 @@ impl DecodeStats {
             self.fps_start = Instant::now();
         }
     }
+
+    pub fn record_bytes(&mut self, input_bytes: u64, decoded_pixels: u64) {
+        self.total_input_bytes += input_bytes;
+        self.total_decoded_pixels += decoded_pixels;
+    }
+
+    pub fn record_display_latency(&mut self, elapsed: Duration) {
+        self.display_latency = elapsed;
+        self.display_latency_recorded = true;
+    }
+
+    pub fn record_network_latency(&mut self, elapsed: Duration) {
+        self.network_latency = elapsed;
+        self.network_latency_recorded = true;
+    }
+
+    pub fn input_throughput_mbps(&self) -> f64 {
+        if self.total_decode_time.is_zero() {
+            return 0.0;
+        }
+        let bits = self.total_input_bytes as f64 * 8.0;
+        let secs = self.total_decode_time.as_secs_f64();
+        bits / secs / 1_000_000.0
+    }
+
+    pub fn output_throughput_mbps(&self) -> f64 {
+        if self.total_decode_time.is_zero() {
+            return 0.0;
+        }
+        let bits = self.total_decoded_pixels as f64 * 4.0 * 8.0;
+        let secs = self.total_decode_time.as_secs_f64();
+        bits / secs / 1_000_000.0
+    }
+
 }
 
+#[derive(Debug, Clone)]
 pub struct DecodedFrame {
     pub data: Vec<u8>,
     pub width: u32,
     pub height: u32,
-    #[allow(dead_code)]
     pub timestamp: Duration,
 }
 
-pub fn decode_all_frames(
-    index: &Mp4Index,
-    config: &VideoConfig,
-) -> Result<(Vec<DecodedFrame>, DecodeStats)> {
-    let decode_config = DecodeConfig::default();
-    let mut decoder = RustH264Decoder::new(config, &decode_config)?;
-    let mut decoded = Vec::new();
-    let mut stats = DecodeStats::default();
+pub struct StreamingDecoder {
+    index: Mp4Index,
+    config: VideoConfig,
+    decode_config: DecodeConfig,
+    decoder: RustH264Decoder,
+    pushed_to: Option<usize>,
+    stats: DecodeStats,
+}
 
-    for i in 0..index.frames.len() {
-        let entry = &index.frames[i];
-        let data = read_frame_data(index, i)?;
-        let pkt = nal_to_media_packet(&data, entry.timestamp, entry.is_keyframe);
+impl StreamingDecoder {
+    pub fn new(index: Mp4Index, config: &VideoConfig) -> Result<Self> {
+        let decode_config = DecodeConfig::default();
+        let decoder = RustH264Decoder::new(config, &decode_config)?;
+        Ok(Self {
+            index,
+            config: config.clone(),
+            decode_config,
+            decoder,
+            pushed_to: None,
+            stats: DecodeStats::default(),
+        })
+    }
 
-        let start = Instant::now();
-        decoder.push_packet(pkt)?;
+    pub fn frame_count(&self) -> usize {
+        self.index.frames.len()
+    }
 
-        while let Some(vf) = decoder.pop_frame()? {
+    fn recreate_at_keyframe(&mut self, target: usize) -> Result<()> {
+        let kf = if self.index.frames.is_empty() {
+            0
+        } else {
+            seek_to_keyframe(&self.index.frames, self.index.frames[target].timestamp)
+        };
+        self.decoder = RustH264Decoder::new(&self.config, &self.decode_config)?;
+        self.pushed_to = Some(kf);
+        Ok(())
+    }
+
+    pub fn decode_frame(&mut self, target: usize) -> Result<DecodedFrame> {
+        if target >= self.index.frames.len() {
+            anyhow::bail!(
+                "frame index {target} out of bounds ({} frames)",
+                self.index.frames.len()
+            );
+        }
+
+        let is_sequential = self.pushed_to.map_or(target == 0, |p| p + 1 == target);
+
+        if !is_sequential {
+            self.recreate_at_keyframe(target)?;
+        }
+
+        if self.pushed_to.is_none() {
+            self.pushed_to = Some(0);
+        }
+
+        let target_ts = self.index.frames[target].timestamp;
+
+        while let Some(p) = self.pushed_to {
+            if p > target {
+                break;
+            }
+            let i = p;
+            let entry = &self.index.frames[i];
+            let data = read_frame_data(&self.index, i)?;
+            let input_bytes = data.len() as u64;
+            let pkt = nal_to_media_packet(&data, entry.timestamp, entry.is_keyframe);
+
+            let start = Instant::now();
+            self.decoder.push_packet(pkt)?;
+            self.stats.record_decode(start.elapsed());
+
+            let mut output_frame: Option<DecodedFrame> = None;
+            while let Some(vf) = self.decoder.pop_frame()? {
+                if vf.timestamp == target_ts || (i == target && output_frame.is_none()) {
+                    let rgba = vf.rgba_image();
+                    let pixels = (rgba.width() * rgba.height()) as u64;
+                    self.stats.record_bytes(input_bytes, pixels);
+                    output_frame = Some(DecodedFrame {
+                        data: rgba.as_raw().to_vec(),
+                        width: rgba.width(),
+                        height: rgba.height(),
+                        timestamp: vf.timestamp,
+                    });
+                }
+            }
+
+            self.pushed_to = Some(i + 1);
+
+            if let Some(frame) = output_frame {
+                return Ok(frame);
+            }
+        }
+
+        if let Some(vf) = self.decoder.pop_frame()? {
             let rgba = vf.rgba_image();
-            decoded.push(DecodedFrame {
+            let pixels = (rgba.width() * rgba.height()) as u64;
+            self.stats.record_bytes(0, pixels);
+            return Ok(DecodedFrame {
                 data: rgba.as_raw().to_vec(),
                 width: rgba.width(),
                 height: rgba.height(),
                 timestamp: vf.timestamp,
             });
         }
-        stats.record_decode(start.elapsed());
+
+        anyhow::bail!("no decoded frame produced for index {target}")
     }
 
-    while let Some(vf) = decoder.pop_frame()? {
-        let rgba = vf.rgba_image();
-        decoded.push(DecodedFrame {
-            data: rgba.as_raw().to_vec(),
-            width: rgba.width(),
-            height: rgba.height(),
-            timestamp: vf.timestamp,
-        });
+    pub fn stats(&self) -> &DecodeStats {
+        &self.stats
     }
 
-    Ok((decoded, stats))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::demux::FrameEntry;
 
     #[test]
     fn test_config_from_video_info() {
@@ -144,11 +264,39 @@ mod tests {
             duration: Duration::ZERO,
             frame_count: 0,
             track_count: 0,
+            h264_profile: 0x42,
+            h264_constraints: 0,
+            h264_level: 0x1E,
         };
         let config = config_from_video_info(&info);
         assert_eq!(config.coded_width, Some(640));
         assert_eq!(config.coded_height, Some(480));
         assert!(matches!(config.codec, VideoCodec::H264(_)));
+        if let VideoCodec::H264(h264) = config.codec {
+            assert_eq!(h264.profile, 0x42);
+            assert_eq!(h264.constraints, 0);
+            assert_eq!(h264.level, 0x1E);
+        }
+    }
+
+    #[test]
+    fn test_config_from_video_info_uses_profile_from_info() {
+        let info = VideoInfo {
+            width: 320,
+            height: 240,
+            duration: Duration::ZERO,
+            frame_count: 0,
+            track_count: 1,
+            h264_profile: 0x64,
+            h264_constraints: 0x80,
+            h264_level: 0x28,
+        };
+        let config = config_from_video_info(&info);
+        if let VideoCodec::H264(h264) = config.codec {
+            assert_eq!(h264.profile, 0x64);
+            assert_eq!(h264.constraints, 0x80);
+            assert_eq!(h264.level, 0x28);
+        }
     }
 
     #[test]
@@ -166,6 +314,10 @@ mod tests {
         let stats = DecodeStats::default();
         assert_eq!(stats.frames_decoded, 0);
         assert_eq!(stats.min_decode_time, Duration::MAX);
+        assert_eq!(stats.total_input_bytes, 0);
+        assert_eq!(stats.total_decoded_pixels, 0);
+        assert!(!stats.display_latency_recorded);
+        assert!(!stats.network_latency_recorded);
     }
 
     #[test]
@@ -190,6 +342,48 @@ mod tests {
         assert_eq!(stats.min_decode_time, Duration::from_millis(5));
     }
 
+    #[test]
+    fn test_decode_stats_record_bytes() {
+        let mut stats = DecodeStats::default();
+        stats.record_bytes(1000, 320 * 240);
+        assert_eq!(stats.total_input_bytes, 1000);
+        assert_eq!(stats.total_decoded_pixels, 320 * 240);
+
+        stats.record_bytes(500, 640 * 480);
+        assert_eq!(stats.total_input_bytes, 1500);
+        assert_eq!(stats.total_decoded_pixels, 320 * 240 + 640 * 480);
+    }
+
+    #[test]
+    fn test_decode_stats_latency() {
+        let mut stats = DecodeStats::default();
+        stats.record_display_latency(Duration::from_millis(16));
+        assert!(stats.display_latency_recorded);
+        assert_eq!(stats.display_latency, Duration::from_millis(16));
+
+        stats.record_network_latency(Duration::from_millis(50));
+        assert!(stats.network_latency_recorded);
+        assert_eq!(stats.network_latency, Duration::from_millis(50));
+    }
+
+    #[test]
+    fn test_throughput_calculation() {
+        let mut stats = DecodeStats::default();
+        stats.record_decode(Duration::from_secs(1));
+        stats.record_bytes(125_000, 1920 * 1080);
+        let input_mbps = stats.input_throughput_mbps();
+        let output_mbps = stats.output_throughput_mbps();
+        assert!((input_mbps - 1.0).abs() < 0.01);
+        assert!(output_mbps > 0.0);
+    }
+
+    #[test]
+    fn test_throughput_zero_when_no_decode() {
+        let stats = DecodeStats::default();
+        assert_eq!(stats.input_throughput_mbps(), 0.0);
+        assert_eq!(stats.output_throughput_mbps(), 0.0);
+    }
+
     fn make_solid_frame(w: u32, h: u32, r: u8, g: u8, b: u8) -> rusty_codecs::format::VideoFrame {
         let mut data = vec![0u8; (w * h * 4) as usize];
         for y in 0..h {
@@ -204,8 +398,52 @@ mod tests {
         rusty_codecs::format::VideoFrame::new_rgba(data.into(), w, h, Duration::ZERO)
     }
 
+    fn make_mock_index(encoded: &[Vec<u8>], keyframes: &[bool]) -> (Mp4Index, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("test.mp4");
+        let mut data = Vec::new();
+        let mut offset = 0u64;
+        let mut frames = Vec::new();
+
+        for (i, frame_data) in encoded.iter().enumerate() {
+            let size = frame_data.len() as u32;
+            data.extend_from_slice(frame_data);
+            frames.push(FrameEntry {
+                offset,
+                size,
+                timestamp: Duration::from_secs_f64(i as f64 / 30.0),
+                is_keyframe: keyframes[i],
+                track_id: 1,
+            });
+            offset += size as u64;
+        }
+
+        std::fs::write(&path, &data).unwrap();
+
+        let info = VideoInfo {
+            width: 320,
+            height: 240,
+            duration: Duration::from_secs_f64(0.0),
+            frame_count: frames.len(),
+            track_count: 1,
+            h264_profile: 0x42,
+            h264_constraints: 0,
+            h264_level: 0x1E,
+        };
+
+        (Mp4Index { info, frames, path }, tmp)
+    }
+
     #[test]
-    fn test_encode_decode_roundtrip() {
+    fn test_streaming_decoder_new() {
+        let (index, _tmp) = make_mock_index(&[], &[]);
+        let config = config_from_video_info(&index.info);
+        let decoder = StreamingDecoder::new(index, &config);
+        assert!(decoder.is_ok());
+    }
+
+    #[test]
+    fn test_streaming_decoder_sequential() {
         use rusty_codecs::codec::h264::H264Encoder;
         use rusty_codecs::format::VideoPreset;
         use rusty_codecs::traits::{VideoEncoder, VideoEncoderFactory};
@@ -226,80 +464,101 @@ mod tests {
             }
         }
 
-        let config = encoder.config();
-        let decode_config = DecodeConfig::default();
-        let mut decoder = RustH264Decoder::new(&config, &decode_config).unwrap();
+        let keyframes: Vec<_> = encoded.iter().map(|p| p.is_keyframe).collect();
+        let raw_data: Vec<_> = encoded.iter().map(|p| p.payload.to_vec()).collect();
+        let (index, _tmp) = make_mock_index(&raw_data, &keyframes);
 
-        let mut decoded_count = 0;
-        for pkt in &encoded {
-            let mp = MediaPacket {
-                timestamp: pkt.timestamp,
-                payload: pkt.payload.clone().into(),
-                is_keyframe: pkt.is_keyframe,
-            };
-            decoder.push_packet(mp).unwrap();
-            while let Some(vf) = decoder.pop_frame().unwrap() {
-                let img = vf.rgba_image();
-                assert_eq!(img.width(), w);
-                assert_eq!(img.height(), h);
-                decoded_count += 1;
+        let config = config_from_video_info(&index.info);
+        let mut decoder = StreamingDecoder::new(index, &config).unwrap();
+
+        let frame0 = decoder.decode_frame(0).unwrap();
+        assert_eq!(frame0.width, w);
+        assert_eq!(frame0.height, h);
+
+        let frame1 = decoder.decode_frame(1).unwrap();
+        assert_eq!(frame1.width, w);
+
+        assert!(decoder.stats().frames_decoded >= 2);
+    }
+
+    #[test]
+    fn test_streaming_decoder_seek_forward() {
+        use rusty_codecs::codec::h264::H264Encoder;
+        use rusty_codecs::format::VideoPreset;
+        use rusty_codecs::traits::{VideoEncoder, VideoEncoderFactory};
+
+        let w = 320u32;
+        let h = 180u32;
+        let mut encoder = H264Encoder::with_preset(VideoPreset::P180).unwrap();
+
+        let input_frames: Vec<_> = (0..5)
+            .map(|i| make_solid_frame(w, h, (i * 50) as u8, 100, 200))
+            .collect();
+
+        let mut encoded = Vec::new();
+        for frame in &input_frames {
+            encoder.push_frame(frame.clone()).unwrap();
+            while let Some(pkt) = encoder.pop_packet().unwrap() {
+                encoded.push(pkt);
             }
         }
-        while let Some(vf) = decoder.pop_frame().unwrap() {
-            let _ = vf.rgba_image();
-            decoded_count += 1;
+
+        let keyframes: Vec<_> = encoded.iter().map(|p| p.is_keyframe).collect();
+        let raw_data: Vec<_> = encoded.iter().map(|p| p.payload.to_vec()).collect();
+        let (index, _tmp) = make_mock_index(&raw_data, &keyframes);
+
+        let config = config_from_video_info(&index.info);
+        let mut decoder = StreamingDecoder::new(index, &config).unwrap();
+
+        let frame0 = decoder.decode_frame(0).unwrap();
+        assert_eq!(frame0.width, w);
+
+        let frame4 = decoder.decode_frame(4).unwrap();
+        assert_eq!(frame4.width, w);
+    }
+
+    #[test]
+    fn test_streaming_decoder_seek_backward() {
+        use rusty_codecs::codec::h264::H264Encoder;
+        use rusty_codecs::format::VideoPreset;
+        use rusty_codecs::traits::{VideoEncoder, VideoEncoderFactory};
+
+        let w = 320u32;
+        let h = 180u32;
+        let mut encoder = H264Encoder::with_preset(VideoPreset::P180).unwrap();
+
+        let input_frames: Vec<_> = (0..5)
+            .map(|i| make_solid_frame(w, h, (i * 50) as u8, 100, 200))
+            .collect();
+
+        let mut encoded = Vec::new();
+        for frame in &input_frames {
+            encoder.push_frame(frame.clone()).unwrap();
+            while let Some(pkt) = encoder.pop_packet().unwrap() {
+                encoded.push(pkt);
+            }
         }
 
-        assert!(
-            decoded_count >= 3,
-            "expected >= 3 decoded frames, got {decoded_count}"
-        );
-    }
+        let keyframes: Vec<_> = encoded.iter().map(|p| p.is_keyframe).collect();
+        let raw_data: Vec<_> = encoded.iter().map(|p| p.payload.to_vec()).collect();
+        let (index, _tmp) = make_mock_index(&raw_data, &keyframes);
 
-    #[test]
-    fn test_decode_all_frames_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("empty.mp4");
-        let index = Mp4Index {
-            info: VideoInfo {
-                width: 320,
-                height: 240,
-                duration: Duration::ZERO,
-                frame_count: 0,
-                track_count: 1,
-            },
-            frames: vec![],
-            path,
-        };
         let config = config_from_video_info(&index.info);
-        let result = decode_all_frames(&index, &config);
-        assert!(result.is_err() || result.unwrap().0.is_empty());
+        let mut decoder = StreamingDecoder::new(index, &config).unwrap();
+
+        let frame4 = decoder.decode_frame(4).unwrap();
+        assert_eq!(frame4.width, w);
+
+        let frame0 = decoder.decode_frame(0).unwrap();
+        assert_eq!(frame0.width, w);
     }
 
     #[test]
-    fn test_decode_nal_errors_on_garbage() {
-        let config = VideoConfig {
-            codec: VideoCodec::H264(H264 {
-                inline: false,
-                profile: 0x42,
-                constraints: 0,
-                level: 0x1E,
-            }),
-            description: None,
-            coded_width: Some(320),
-            coded_height: Some(240),
-            display_ratio_width: None,
-            display_ratio_height: None,
-            bitrate: None,
-            framerate: None,
-            optimize_for_latency: None,
-        };
-        let decode_config = DecodeConfig::default();
-        let mut decoder = RustH264Decoder::new(&config, &decode_config).unwrap();
-
-        let garbage = vec![0xffu8; 1024];
-        let pkt = nal_to_media_packet(&garbage, Duration::ZERO, true);
-        let result = decoder.push_packet(pkt);
+    fn test_streaming_decoder_out_of_bounds() {
+        let (index, _tmp) = make_mock_index(&[], &[]);
+        let config = config_from_video_info(&index.info);
+        let mut decoder = StreamingDecoder::new(index, &config).unwrap();
+        let result = decoder.decode_frame(0);
         assert!(result.is_err());
     }
 }

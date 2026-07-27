@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use shiguredo_mp4::boxes::SampleEntry;
 use shiguredo_mp4::demux::{Input, Mp4FileDemuxer};
 use shiguredo_mp4::TrackKind;
 
@@ -20,6 +21,9 @@ pub struct VideoInfo {
     pub duration: Duration,
     pub frame_count: usize,
     pub track_count: usize,
+    pub h264_profile: u8,
+    pub h264_constraints: u8,
+    pub h264_level: u8,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +101,9 @@ pub fn demux_file(path: &Path) -> Result<Mp4Index, DemuxError> {
     let track_count = tracks.len();
     let mut width = 0u16;
     let mut height = 0u16;
+    let mut h264_profile = 0x42u8;
+    let mut h264_constraints = 0u8;
+    let mut h264_level = 0x1Eu8;
 
     let mut frames = Vec::new();
 
@@ -113,6 +120,11 @@ pub fn demux_file(path: &Path) -> Result<Mp4Index, DemuxError> {
                 {
                     width = w;
                     height = h;
+                    if let SampleEntry::Avc1(avc1) = sample_entry {
+                        h264_profile = avc1.avcc_box.avc_profile_indication;
+                        h264_constraints = avc1.avcc_box.profile_compatibility;
+                        h264_level = avc1.avcc_box.avc_level_indication;
+                    }
                 }
 
                 let timestamp = if timescale > 0.0 {
@@ -140,6 +152,9 @@ pub fn demux_file(path: &Path) -> Result<Mp4Index, DemuxError> {
         duration,
         frame_count: frames.len(),
         track_count,
+        h264_profile,
+        h264_constraints,
+        h264_level,
     };
 
     Ok(Mp4Index {

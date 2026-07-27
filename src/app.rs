@@ -5,7 +5,7 @@ use eframe::egui::{self, Frame, OutputCommand, Panel, RichText, Vec2};
 use crate::{
     chat::{ChatEngine, ChatMessage, LocalChatEngine},
     codec,
-    decode::{self, DecodedFrame, DecodeStats},
+    decode,
     demux::{self, Mp4Index},
     room::RoomState,
     ticket::PartyTicket,
@@ -31,12 +31,14 @@ pub struct PeerLinkApp {
     playback_started: Option<Instant>,
     elapsed: f64,
 
-    // decoded video frames
-    decoded_frames: Vec<DecodedFrame>,
-    decode_stats: Option<DecodeStats>,
+    // decoded video frames (streaming decoder - on-demand decode)
+    streaming_decoder: Option<decode::StreamingDecoder>,
+    current_decoded_frame: Option<decode::DecodedFrame>,
+    last_displayed_frame: usize,
     video_texture: Option<egui::TextureHandle>,
-    current_texture_frame: usize,
     show_stats: bool,
+    display_latency_start: Option<std::time::Instant>,
+    display_latency: Option<std::time::Duration>,
 }
 
 impl Default for PeerLinkApp {
@@ -56,11 +58,13 @@ impl Default for PeerLinkApp {
             playback_started: None,
             elapsed: 0.0,
 
-            decoded_frames: Vec::new(),
-            decode_stats: None,
+            streaming_decoder: None,
+            current_decoded_frame: None,
+            last_displayed_frame: 0,
             video_texture: None,
-            current_texture_frame: 0,
             show_stats: false,
+            display_latency_start: None,
+            display_latency: None,
         }
     }
 }
@@ -291,8 +295,8 @@ impl PeerLinkApp {
             ui.label(format!("{pos} / {dur}"));
 
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let has_decoded = !self.decoded_frames.is_empty();
-                if ui.selectable_label(has_decoded, "📊").clicked() {
+                let has_decoder = self.streaming_decoder.is_some();
+                if ui.selectable_label(has_decoder, "📊").clicked() {
                     self.show_stats = !self.show_stats;
                 }
 
@@ -310,7 +314,8 @@ impl PeerLinkApp {
     }
 
     fn render_decode_stats(&mut self, ui: &mut egui::Ui) {
-        let Some(ref stats) = self.decode_stats else { return };
+        let Some(ref decoder) = self.streaming_decoder else { return };
+        let stats = decoder.stats();
         if stats.frames_decoded == 0 {
             return;
         }
@@ -341,11 +346,32 @@ impl PeerLinkApp {
                 "Total decode: {:.1}s",
                 stats.total_decode_time.as_secs_f64()
             ));
-            if !self.decoded_frames.is_empty() {
+            if let Some(ref frame) = self.current_decoded_frame {
                 ui.label(format!(
                     "Display: {}×{}",
-                    self.decoded_frames[0].width,
-                    self.decoded_frames[0].height
+                    frame.width, frame.height
+                ));
+            }
+        });
+        ui.horizontal(|ui| {
+            let in_mbps = stats.input_throughput_mbps();
+            let out_mbps = stats.output_throughput_mbps();
+            if in_mbps > 0.0 {
+                ui.label(format!("In: {:.1} Mbps", in_mbps));
+            }
+            if out_mbps > 0.0 {
+                ui.label(format!("Out: {:.1} Mbps", out_mbps));
+            }
+            if let Some(lat) = self.display_latency {
+                ui.label(format!(
+                    "Disp: {:.1}ms",
+                    lat.as_secs_f64() * 1000.0
+                ));
+            }
+            if stats.network_latency_recorded {
+                ui.label(format!(
+                    "Net: {:.1}ms",
+                    stats.network_latency.as_secs_f64() * 1000.0
                 ));
             }
         });
@@ -386,7 +412,7 @@ impl PeerLinkApp {
 
             ui.vertical_centered(|ui| {
                 ui.add_space(ui.available_height() * 0.3);
-                ui.label("🎥 (decoded frames pending)");
+                ui.label("🎥 (decoding…)");
                 ui.add_space(4.0);
                 ui.label(file);
                 ui.add_space(4.0);
@@ -401,15 +427,66 @@ impl PeerLinkApp {
         }
     }
 
+    fn needs_frame_decode(&self, current_frame: usize) -> bool {
+        self.current_decoded_frame.is_none()
+            || self.video_texture.is_none()
+            || current_frame != self.last_displayed_frame
+    }
+
+    fn ensure_frame_decoded(
+        &mut self,
+        frame_idx: usize,
+    ) -> Option<&decode::DecodedFrame> {
+        if !self.needs_frame_decode(frame_idx) {
+            return self.current_decoded_frame.as_ref();
+        }
+
+        if self.streaming_decoder.is_none() {
+            let index = self.video_index.as_ref()?;
+            let config = decode::config_from_video_info(&index.info);
+            match decode::StreamingDecoder::new(index.clone(), &config) {
+                Ok(decoder) => self.streaming_decoder = Some(decoder),
+                Err(e) => {
+                    tracing::warn!("Failed to create decoder: {e}");
+                    return None;
+                }
+            }
+        }
+
+        self.display_latency_start = Some(std::time::Instant::now());
+
+        match self
+            .streaming_decoder
+            .as_mut()
+            .unwrap()
+            .decode_frame(frame_idx)
+        {
+            Ok(frame) => {
+                self.current_decoded_frame = Some(frame);
+                self.current_decoded_frame.as_ref()
+            }
+            Err(e) => {
+                tracing::warn!("Failed to decode frame {frame_idx}: {e}");
+                None
+            }
+        }
+    }
+
     fn sync_video_texture(&mut self, ui: &mut egui::Ui) {
-        if self.decoded_frames.is_empty() {
+        let frame_idx = self
+            .current_frame
+            .min(
+                self.video_index
+                    .as_ref()
+                    .map_or(0, |i| i.frames.len().saturating_sub(1)),
+            );
+
+        if !self.needs_frame_decode(frame_idx) {
             return;
         }
-        let frame_idx = self.current_frame.min(self.decoded_frames.len() - 1);
-        if frame_idx == self.current_texture_frame && self.video_texture.is_some() {
-            return;
-        }
-        let frame = &self.decoded_frames[frame_idx];
+
+        let Some(frame) = self.ensure_frame_decoded(frame_idx) else { return };
+
         let color_image = egui::ColorImage::from_rgba_unmultiplied(
             [frame.width as usize, frame.height as usize],
             &frame.data,
@@ -424,7 +501,12 @@ impl PeerLinkApp {
                 ));
             }
         }
-        self.current_texture_frame = frame_idx;
+        if let Some(latency_start) = self.display_latency_start {
+            self.display_latency = Some(
+                std::time::Instant::now().duration_since(latency_start),
+            );
+        }
+        self.last_displayed_frame = frame_idx;
     }
 
     fn render_video_prompt_host(&mut self, ui: &mut egui::Ui) {
@@ -517,25 +599,23 @@ impl PeerLinkApp {
             match demux::demux_file(&path) {
                 Ok(index) => {
                     let config = decode::config_from_video_info(&index.info);
-                    let r = decode::decode_all_frames(&index, &config);
-                    match r {
-                        Ok((frames, stats)) => {
-                            self.decoded_frames = frames;
-                            self.decode_stats = Some(stats);
-                        }
+                    match decode::StreamingDecoder::new(index.clone(), &config) {
+                        Ok(dec) => self.streaming_decoder = Some(dec),
                         Err(e) => {
-                            tracing::warn!("Failed to decode frames: {e}");
-                            self.decoded_frames = Vec::new();
-                            self.decode_stats = None;
+                            tracing::warn!("Failed to create decoder: {e}");
+                            self.streaming_decoder = None;
                         }
                     }
                     self.video_index = Some(index);
                     self.video_texture = None;
-                    self.current_texture_frame = 0;
+                    self.current_decoded_frame = None;
+                    self.last_displayed_frame = 0;
                     self.current_frame = 0;
                     self.is_playing = false;
                     self.playback_started = None;
                     self.elapsed = 0.0;
+                    self.display_latency = None;
+                    self.display_latency_start = None;
                 }
                 Err(e) => {
                     tracing::error!("Failed to demux file: {e}");
