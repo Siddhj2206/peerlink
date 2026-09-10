@@ -1,0 +1,13 @@
+[package]
+name = "peerlink-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+iroh-docs.workspace = true
+iroh-gossip.workspace = true
+iroh-tickets.workspace = true
+postcard.workspace = true
+rand.workspace = true
+serde.workspace = true
+sha2.workspace = true

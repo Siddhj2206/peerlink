@@ -1,0 +1,36 @@
+[package]
+name = "peerlink-egui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "peerlink-egui"
+path = "src/main.rs"
+
+[dependencies]
+peerlink-core = { path = "../peerlink-core" }
+
+anyhow.workspace = true
+bytes.workspace = true
+eframe.workspace = true
+hex.workspace = true
+iroh.workspace = true
+iroh-docs.workspace = true
+iroh-gossip.workspace = true
+iroh-live.workspace = true
+iroh-tickets.workspace = true
+pollster.workspace = true
+postcard.workspace = true
+rand.workspace = true
+rfd.workspace = true
+rusty-codecs.workspace = true
+serde.workspace = true
+sha2.workspace = true
+shiguredo_mp4.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+wgpu.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

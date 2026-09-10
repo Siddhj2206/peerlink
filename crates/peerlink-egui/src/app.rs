@@ -2,13 +2,12 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Frame, OutputCommand, Panel, RichText, Vec2};
 
+use peerlink_core::{PartyTicket, RoomState, generate_room_code, words_to_topic_id};
+
 use crate::{
     chat::{ChatEngine, ChatMessage, LocalChatEngine},
-    codec,
     decode,
     demux::{self, Mp4Index},
-    room::RoomState,
-    ticket::PartyTicket,
 };
 
 const APP_NAME: &str = "PeerLink";
@@ -578,8 +577,8 @@ impl PeerLinkApp {
     }
 
     fn create_room(&mut self) {
-        let room_code = codec::generate_room_code();
-        let topic_id = codec::words_to_topic_id(&room_code);
+        let room_code = generate_room_code();
+        let topic_id = words_to_topic_id(&room_code);
         let namespace_id = iroh_docs::NamespaceId::from(&rand::random::<[u8; 32]>());
         let ticket = PartyTicket::new(topic_id, namespace_id);
         let ticket_string = ticket.to_string_encoded();

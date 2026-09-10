@@ -1,3 +1,9 @@
+//! Human-readable room codes and the topic ids derived from them.
+//!
+//! A room code is a memorisable phrase (`CODE_WORDS` dictionary words) that a
+//! Host reads aloud. The gossip topic is not the phrase itself but its SHA-256
+//! digest, so the code can be shared independently of the wire id.
+
 use iroh_gossip::TopicId;
 use sha2::{Digest, Sha256};
 

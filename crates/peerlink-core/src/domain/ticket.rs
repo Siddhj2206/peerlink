@@ -1,3 +1,9 @@
+//! The shareable Party ticket.
+//!
+//! A ticket is the one string a Host hands to a Guest. It is encoded with
+//! `postcard` inside `iroh-tickets`' base32 envelope, so it carries a `party`
+//! prefix and is safe to paste through any chat channel.
+
 use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 use iroh_tickets::{ParseError, Ticket};

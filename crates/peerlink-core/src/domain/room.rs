@@ -1,3 +1,9 @@
+//! The room lifecycle state machine.
+//!
+//! `RoomState` is the single source of truth for which screen a UI should show
+//! and what a Host/Joiner is currently allowed to do. Transitions consume and
+//! return `self`, so an invalid transition is impossible to express.
+
 use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 
