@@ -80,83 +80,89 @@ const WORDS: &[&str] = &[
     "zebra", "zone",
 ];
 
+/// How many dictionary words make up a room code.
 pub const CODE_WORDS: usize = 6;
 
+/// Generate a fresh, human-readable room code.
 pub fn generate_room_code() -> String {
     use rand::RngExt;
+
     let mut rng = rand::rng();
-    let mut words = Vec::with_capacity(CODE_WORDS);
-    for _ in 0..CODE_WORDS {
-        let idx = rng.random_range(0..WORDS.len());
-        words.push(WORDS[idx]);
-    }
-    words.join(" ")
+    (0..CODE_WORDS)
+        .map(|_| WORDS[rng.random_range(0..WORDS.len())])
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
+/// Fold a room code (or any phrase) into the gossip topic it names.
 pub fn words_to_topic_id(phrase: &str) -> TopicId {
-    let normalized: String = phrase
+    let digest: [u8; 32] = Sha256::digest(normalize(phrase).as_bytes()).into();
+    TopicId::from_bytes(digest)
+}
+
+/// Collapse whitespace and case so `"Alpha  Bravo"` and `"alpha bravo"` are
+/// the same code.
+fn normalize(phrase: &str) -> String {
+    phrase
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_lowercase();
-    let hash = Sha256::digest(normalized.as_bytes());
-    let bytes: [u8; 32] = hash.into();
-    TopicId::from_bytes(bytes)
+        .to_lowercase()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_generate_room_code_length() {
-        let code = generate_room_code();
-        let word_count = code.split_whitespace().count();
-        assert_eq!(word_count, CODE_WORDS);
-    }
+    const SAMPLE: &str = "alpha bravo charlie";
 
     #[test]
-    fn test_generate_room_code_uses_dictionary_words() {
+    fn room_code_is_six_dictionary_words() {
         let code = generate_room_code();
-        for word in code.split_whitespace() {
-            assert!(WORDS.contains(&word), "word {word:?} not in dictionary");
+        let words: Vec<_> = code.split_whitespace().collect();
+        assert_eq!(words.len(), CODE_WORDS);
+        for word in words {
+            assert!(WORDS.contains(&word), "not a dictionary word: {word:?}");
         }
     }
 
     #[test]
-    fn test_words_to_topic_id_is_deterministic() {
-        let phrase = "alpha bravo charlie delta echo foxtrot";
-        let id1 = words_to_topic_id(phrase);
-        let id2 = words_to_topic_id(phrase);
-        assert_eq!(id1, id2);
+    fn topic_is_sha256_of_the_normalized_phrase() {
+        let expected: [u8; 32] = [
+            0xbd, 0xe3, 0xc5, 0x0e, 0xca, 0x48, 0xa7, 0xcc, 0xe7, 0xc0, 0x9f, 0x3e, 0xf9, 0x68,
+            0x4f, 0xba, 0x2b, 0x57, 0x3a, 0x46, 0xb8, 0x3d, 0x5c, 0xfe, 0xfe, 0x44, 0x9f, 0x68,
+            0x34, 0x1c, 0xd5, 0x95,
+        ];
+        assert_eq!(words_to_topic_id(SAMPLE).as_bytes(), &expected);
     }
 
     #[test]
-    fn test_words_to_topic_id_different_phrases_differ() {
-        let id1 = words_to_topic_id("alpha bravo charlie");
-        let id2 = words_to_topic_id("alpha bravo delta");
-        assert_ne!(id1, id2);
+    fn topic_is_deterministic() {
+        assert_eq!(words_to_topic_id(SAMPLE), words_to_topic_id(SAMPLE));
     }
 
     #[test]
-    fn test_words_to_topic_id_normalizes_whitespace() {
-        let id1 = words_to_topic_id("alpha  bravo\ncharlie");
-        let id2 = words_to_topic_id("alpha bravo charlie");
-        assert_eq!(id1, id2);
+    fn topic_normalizes_case_and_whitespace() {
+        assert_eq!(
+            words_to_topic_id("  Alpha\tBravo\nCharlie  "),
+            words_to_topic_id(SAMPLE)
+        );
     }
 
     #[test]
-    fn test_words_to_topic_id_normalizes_case() {
-        let id1 = words_to_topic_id("Alpha Bravo Charlie");
-        let id2 = words_to_topic_id("alpha bravo charlie");
-        assert_eq!(id1, id2);
+    fn different_phrases_get_different_topics() {
+        assert_ne!(
+            words_to_topic_id("alpha bravo charlie"),
+            words_to_topic_id("alpha bravo delta")
+        );
     }
 
     #[test]
-    fn test_generated_code_round_trips() {
+    fn generated_code_maps_to_a_stable_topic() {
         let code = generate_room_code();
-        let topic_id = words_to_topic_id(&code);
-        let _bytes: &[u8; 32] = topic_id.as_bytes();
-        assert!(!code.is_empty());
+        assert_eq!(
+            words_to_topic_id(&code),
+            words_to_topic_id(&code.to_uppercase())
+        );
     }
 }

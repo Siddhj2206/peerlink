@@ -9,6 +9,10 @@ use iroh_gossip::TopicId;
 use iroh_tickets::{ParseError, Ticket};
 use serde::{Deserialize, Serialize};
 
+/// What a Guest needs in order to reach a Host's room.
+///
+/// The ids are stored as raw bytes rather than the iroh newtypes so the wire
+/// format stays explicit and stable across dependency upgrades.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PartyTicket {
     version: u8,
@@ -17,9 +21,12 @@ pub struct PartyTicket {
 }
 
 impl PartyTicket {
+    /// Current ticket format version.
+    const VERSION: u8 = 0;
+
     pub fn new(topic_id: TopicId, namespace_id: NamespaceId) -> Self {
         Self {
-            version: 0,
+            version: Self::VERSION,
             topic_id: *topic_id.as_bytes(),
             namespace_id: namespace_id.to_bytes(),
         }
@@ -33,10 +40,12 @@ impl PartyTicket {
         NamespaceId::from(&self.namespace_id)
     }
 
+    /// Parse a ticket string pasted by a Guest.
     pub fn parse(s: &str) -> Result<Self, ParseError> {
         Self::decode_string(s)
     }
 
+    /// Encode to the pasteable string form.
     pub fn to_string_encoded(&self) -> String {
         self.encode_string()
     }
@@ -58,80 +67,56 @@ impl Ticket for PartyTicket {
 mod tests {
     use super::*;
 
-    fn test_topic_id() -> TopicId {
-        TopicId::from_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ])
+    fn topic() -> TopicId {
+        TopicId::from_bytes([0x11; 32])
     }
 
-    fn test_namespace_id() -> NamespaceId {
-        NamespaceId::from(&[
-            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2,
-            0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5, 0xe4,
-            0xe3, 0xe2, 0xe1, 0xe0,
-        ])
+    fn namespace() -> NamespaceId {
+        NamespaceId::from(&[0x22; 32])
+    }
+
+    fn ticket() -> PartyTicket {
+        PartyTicket::new(topic(), namespace())
     }
 
     #[test]
-    fn test_party_ticket_round_trip_bytes() {
-        let topic_id = test_topic_id();
-        let ns_id = test_namespace_id();
-        let ticket = PartyTicket::new(topic_id, ns_id);
-        let bytes = ticket.encode_bytes();
-        let decoded = PartyTicket::decode_bytes(&bytes).unwrap();
-        assert_eq!(ticket, decoded);
-        assert_eq!(decoded.topic_id(), topic_id);
-        assert_eq!(decoded.namespace_id(), ns_id);
+    fn bytes_round_trip() {
+        let decoded = PartyTicket::decode_bytes(&ticket().encode_bytes()).unwrap();
+        assert_eq!(decoded, ticket());
+        assert_eq!(decoded.topic_id(), topic());
+        assert_eq!(decoded.namespace_id(), namespace());
     }
 
     #[test]
-    fn test_party_ticket_round_trip_string() {
-        let topic_id = test_topic_id();
-        let ns_id = test_namespace_id();
-        let ticket = PartyTicket::new(topic_id, ns_id);
-        let s = ticket.encode_string();
-        assert!(s.starts_with("party"), "string should start with 'party', got: {s}");
-        let decoded = PartyTicket::decode_string(&s).unwrap();
-        assert_eq!(ticket, decoded);
+    fn string_round_trip_keeps_the_party_prefix() {
+        let s = ticket().encode_string();
+        assert!(s.starts_with("party"), "missing prefix: {s}");
+        assert_eq!(PartyTicket::decode_string(&s).unwrap(), ticket());
     }
 
     #[test]
-    fn test_party_ticket_parse() {
-        let topic_id = test_topic_id();
-        let ns_id = test_namespace_id();
-        let ticket = PartyTicket::new(topic_id, ns_id);
-        let s = ticket.to_string_encoded();
-        let parsed = PartyTicket::parse(&s).unwrap();
-        assert_eq!(parsed.topic_id(), topic_id);
-        assert_eq!(parsed.namespace_id(), ns_id);
+    fn parse_accepts_its_own_encoding() {
+        let parsed = PartyTicket::parse(&ticket().to_string_encoded()).unwrap();
+        assert_eq!(parsed.topic_id(), topic());
+        assert_eq!(parsed.namespace_id(), namespace());
     }
 
     #[test]
-    fn test_invalid_prefix_rejected() {
-        let result = PartyTicket::decode_string("wrongprefixabc123");
-        assert!(result.is_err());
+    fn encoding_is_deterministic() {
+        assert_eq!(ticket().encode_string(), ticket().encode_string());
     }
 
     #[test]
-    fn test_invalid_base32_rejected() {
-        let result = PartyTicket::decode_string("party!!!invalid!!!");
-        assert!(result.is_err());
+    fn distinct_ids_produce_distinct_tickets() {
+        let other = PartyTicket::new(TopicId::from_bytes([0x33; 32]), namespace());
+        assert_ne!(ticket(), other);
+        assert_ne!(ticket().encode_string(), other.encode_string());
     }
 
     #[test]
-    fn test_empty_string_rejected() {
-        let result = PartyTicket::decode_string("");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_deterministic_encoding() {
-        let topic_id = test_topic_id();
-        let ns_id = test_namespace_id();
-        let ticket1 = PartyTicket::new(topic_id, ns_id);
-        let ticket2 = PartyTicket::new(topic_id, ns_id);
-        assert_eq!(ticket1.encode_string(), ticket2.encode_string());
+    fn malformed_strings_are_rejected() {
+        assert!(PartyTicket::parse("").is_err());
+        assert!(PartyTicket::parse("wrongprefixabc123").is_err());
+        assert!(PartyTicket::parse("party!!!invalid!!!").is_err());
     }
 }

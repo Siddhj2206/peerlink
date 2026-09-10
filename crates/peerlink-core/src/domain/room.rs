@@ -1,81 +1,40 @@
 //! The room lifecycle state machine.
 //!
 //! `RoomState` is the single source of truth for which screen a UI should show
-//! and what a Host/Joiner is currently allowed to do. Transitions consume and
-//! return `self`, so an invalid transition is impossible to express.
+//! and what a Host or Joiner is currently allowed to do. Every transition
+//! consumes `self` and returns the next state, so an illegal transition cannot
+//! be expressed — there is no `.unwrap()` for a caller to forget.
 
 use iroh_docs::NamespaceId;
 use iroh_gossip::TopicId;
 
+/// Where the app is in the create/join lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum RoomState {
+    /// Nothing in progress; the Home screen.
     #[default]
     Idle,
+    /// This peer created the room and is the Host.
     Hosting {
         room_code: String,
         ticket_string: String,
         topic_id: TopicId,
         namespace_id: NamespaceId,
     },
-    Joining {
-        ticket_input: String,
-    },
+    /// A ticket has been entered but not yet resolved.
+    Joining { ticket_input: String },
+    /// This peer joined a Host's room.
     Joined {
         room_code: String,
         topic_id: TopicId,
         namespace_id: NamespaceId,
     },
-    Error {
-        message: String,
-    },
+    /// The last action failed; the message is shown until dismissed.
+    Error { message: String },
 }
 
-
 impl RoomState {
-    pub fn is_idle(&self) -> bool {
-        matches!(self, Self::Idle)
-    }
-
-    pub fn is_hosting(&self) -> bool {
-        matches!(self, Self::Hosting { .. })
-    }
-
-    pub fn is_joined(&self) -> bool {
-        matches!(self, Self::Joined { .. })
-    }
-
-    pub fn is_joining(&self) -> bool {
-        matches!(self, Self::Joining { .. })
-    }
-
-    pub fn is_error(&self) -> bool {
-        matches!(self, Self::Error { .. })
-    }
-
-    pub fn room_code(&self) -> Option<&str> {
-        match self {
-            Self::Hosting { room_code, .. } => Some(room_code),
-            Self::Joined { room_code, .. } => Some(room_code),
-            _ => None,
-        }
-    }
-
-    pub fn topic_id(&self) -> Option<TopicId> {
-        match self {
-            Self::Hosting { topic_id, .. } => Some(*topic_id),
-            Self::Joined { topic_id, .. } => Some(*topic_id),
-            _ => None,
-        }
-    }
-
-    pub fn namespace_id(&self) -> Option<NamespaceId> {
-        match self {
-            Self::Hosting { namespace_id, .. } => Some(*namespace_id),
-            Self::Joined { namespace_id, .. } => Some(*namespace_id),
-            _ => None,
-        }
-    }
-
+    /// Begin hosting a freshly created room.
     pub fn start_hosting(
         room_code: String,
         ticket_string: String,
@@ -90,10 +49,12 @@ impl RoomState {
         }
     }
 
+    /// Record that the user is entering a ticket.
     pub fn start_joining(ticket_input: String) -> Self {
         Self::Joining { ticket_input }
     }
 
+    /// Resolve a pending join. No-op unless currently `Joining`.
     pub fn join(self, room_code: String, topic_id: TopicId, namespace_id: NamespaceId) -> Self {
         match self {
             Self::Joining { .. } => Self::Joined {
@@ -105,6 +66,7 @@ impl RoomState {
         }
     }
 
+    /// Leave the room. `Idle` and `Error` are left untouched.
     pub fn leave(self) -> Self {
         match self {
             Self::Hosting { .. } | Self::Joined { .. } | Self::Joining { .. } => Self::Idle,
@@ -112,14 +74,62 @@ impl RoomState {
         }
     }
 
+    /// Enter the error state.
     pub fn fail(message: String) -> Self {
         Self::Error { message }
     }
 
+    /// Clear an error. No-op unless currently `Error`.
     pub fn dismiss_error(self) -> Self {
         match self {
             Self::Error { .. } => Self::Idle,
             other => other,
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
+    pub fn is_hosting(&self) -> bool {
+        matches!(self, Self::Hosting { .. })
+    }
+
+    pub fn is_joining(&self) -> bool {
+        matches!(self, Self::Joining { .. })
+    }
+
+    pub fn is_joined(&self) -> bool {
+        matches!(self, Self::Joined { .. })
+    }
+
+    pub fn is_error(&self) -> bool {
+        matches!(self, Self::Error { .. })
+    }
+
+    /// The room code, once one is known.
+    pub fn room_code(&self) -> Option<&str> {
+        match self {
+            Self::Hosting { room_code, .. } | Self::Joined { room_code, .. } => Some(room_code),
+            _ => None,
+        }
+    }
+
+    /// The gossip topic, once connected to a room.
+    pub fn topic_id(&self) -> Option<TopicId> {
+        match self {
+            Self::Hosting { topic_id, .. } | Self::Joined { topic_id, .. } => Some(*topic_id),
+            _ => None,
+        }
+    }
+
+    /// The chat namespace, once connected to a room.
+    pub fn namespace_id(&self) -> Option<NamespaceId> {
+        match self {
+            Self::Hosting { namespace_id, .. } | Self::Joined { namespace_id, .. } => {
+                Some(*namespace_id)
+            }
+            _ => None,
         }
     }
 }
@@ -128,182 +138,82 @@ impl RoomState {
 mod tests {
     use super::*;
 
-    fn test_topic_id() -> TopicId {
-        TopicId::from_bytes([
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
-            0x1c, 0x1d, 0x1e, 0x1f,
-        ])
+    fn topic() -> TopicId {
+        TopicId::from_bytes([0x11; 32])
     }
 
-    fn test_namespace_id() -> NamespaceId {
-        NamespaceId::from(&[
-            0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, 0xf7, 0xf6, 0xf5, 0xf4, 0xf3, 0xf2,
-            0xf1, 0xf0, 0xef, 0xee, 0xed, 0xec, 0xeb, 0xea, 0xe9, 0xe8, 0xe7, 0xe6, 0xe5, 0xe4,
-            0xe3, 0xe2, 0xe1, 0xe0,
-        ])
+    fn namespace() -> NamespaceId {
+        NamespaceId::from(&[0x22; 32])
+    }
+
+    fn hosting() -> RoomState {
+        RoomState::start_hosting("code".into(), "ticket".into(), topic(), namespace())
     }
 
     #[test]
-    fn test_idle_is_default() {
-        let state = RoomState::default();
-        assert!(state.is_idle());
-        assert!(!state.is_hosting());
-        assert!(!state.is_joined());
+    fn default_is_idle() {
+        assert!(RoomState::default().is_idle());
     }
 
     #[test]
-    fn test_start_hosting_transition() {
-        let topic_id = test_topic_id();
-        let ns_id = test_namespace_id();
-        let state = RoomState::start_hosting(
-            "alpha bravo charlie delta echo foxtrot".into(),
-            "partyabc123".into(),
-            topic_id,
-            ns_id,
-        );
+    fn hosting_exposes_room_identity() {
+        let state = hosting();
         assert!(state.is_hosting());
-        assert_eq!(state.room_code(), Some("alpha bravo charlie delta echo foxtrot"));
-        assert_eq!(state.topic_id(), Some(topic_id));
-        assert_eq!(state.namespace_id(), Some(ns_id));
+        assert_eq!(state.room_code(), Some("code"));
+        assert_eq!(state.topic_id(), Some(topic()));
+        assert_eq!(state.namespace_id(), Some(namespace()));
     }
 
     #[test]
-    fn test_start_joining_transition() {
-        let state = RoomState::start_joining("partyabc123".into());
+    fn joining_hides_room_identity_until_resolved() {
+        let state = RoomState::start_joining("ticket".into());
         assert!(state.is_joining());
-    }
-
-    #[test]
-    fn test_join_transition_from_joining() {
-        let state = RoomState::start_joining("partyabc123".into());
-        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
-        assert!(state.is_joined());
-        assert_eq!(state.room_code(), Some("room code"));
-        assert_eq!(state.topic_id(), Some(test_topic_id()));
-        assert_eq!(state.namespace_id(), Some(test_namespace_id()));
-    }
-
-    #[test]
-    fn test_join_from_non_joining_is_noop() {
-        let state = RoomState::Idle;
-        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_leave_hosting_returns_to_idle() {
-        let state = RoomState::start_hosting(
-            "room code".into(),
-            "partyabc".into(),
-            test_topic_id(),
-            test_namespace_id(),
-        );
-        let state = state.leave();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_leave_joined_returns_to_idle() {
-        let state = RoomState::start_joining("ticket".into());
-        let state = state.join("room code".into(), test_topic_id(), test_namespace_id());
-        let state = state.leave();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_leave_idle_is_noop() {
-        let state = RoomState::Idle;
-        let state = state.leave();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_error_transition() {
-        let state = RoomState::fail("connection failed".into());
-        assert!(state.is_error());
-    }
-
-    #[test]
-    fn test_dismiss_error_returns_to_idle() {
-        let state = RoomState::fail("connection failed".into());
-        let state = state.dismiss_error();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_dismiss_error_from_idle_is_noop() {
-        let state = RoomState::Idle;
-        let state = state.dismiss_error();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_dismiss_error_from_hosting_is_noop() {
-        let state = RoomState::start_hosting(
-            "code".into(),
-            "ticket".into(),
-            test_topic_id(),
-            test_namespace_id(),
-        );
-        let state = state.dismiss_error();
-        assert!(state.is_hosting());
-    }
-
-    #[test]
-    fn test_leave_error_returns_to_idle_via_dismiss() {
-        let state = RoomState::fail("oops".into());
-        let state = state.dismiss_error();
-        assert!(state.is_idle());
-    }
-
-    #[test]
-    fn test_room_code_none_for_idle() {
-        let state = RoomState::Idle;
         assert_eq!(state.room_code(), None);
-    }
-
-    #[test]
-    fn test_topic_id_none_for_error() {
-        let state = RoomState::fail("error".into());
         assert_eq!(state.topic_id(), None);
+        assert_eq!(state.namespace_id(), None);
     }
 
     #[test]
-    fn test_joining_state_not_merged() {
-        let state = RoomState::start_joining("partyxyz".into());
+    fn join_resolves_a_pending_join() {
+        let state = RoomState::start_joining("ticket".into()).join("code".into(), topic(), namespace());
+        assert!(state.is_joined());
+        assert_eq!(state.room_code(), Some("code"));
+        assert_eq!(state.topic_id(), Some(topic()));
+        assert_eq!(state.namespace_id(), Some(namespace()));
+    }
+
+    #[test]
+    fn join_outside_joining_is_a_no_op() {
+        let state = RoomState::Idle.join("code".into(), topic(), namespace());
+        assert!(state.is_idle());
+    }
+
+    #[test]
+    fn leave_resets_hosting_and_joined_to_idle() {
+        assert!(hosting().leave().is_idle());
+
+        let joined = RoomState::start_joining("t".into()).join("c".into(), topic(), namespace());
+        assert!(joined.leave().is_idle());
+    }
+
+    #[test]
+    fn leave_is_a_no_op_from_idle_and_error() {
+        assert!(RoomState::Idle.leave().is_idle());
+        assert!(RoomState::fail("boom".into()).leave().is_error());
+    }
+
+    #[test]
+    fn dismiss_error_clears_only_an_error() {
+        assert!(RoomState::fail("boom".into()).dismiss_error().is_idle());
+        assert!(hosting().dismiss_error().is_hosting());
+    }
+
+    #[test]
+    fn error_hides_room_identity() {
+        let state = RoomState::fail("boom".into());
+        assert!(state.is_error());
         assert_eq!(state.room_code(), None);
-    }
-
-    #[test]
-    fn test_namespace_id_none_for_idle() {
-        let state = RoomState::Idle;
+        assert_eq!(state.topic_id(), None);
         assert_eq!(state.namespace_id(), None);
-    }
-
-    #[test]
-    fn test_namespace_id_none_for_error() {
-        let state = RoomState::fail("error".into());
-        assert_eq!(state.namespace_id(), None);
-    }
-
-    #[test]
-    fn test_namespace_id_available_in_hosting() {
-        let ns_id = test_namespace_id();
-        let state = RoomState::start_hosting(
-            "code".into(),
-            "ticket".into(),
-            test_topic_id(),
-            ns_id,
-        );
-        assert_eq!(state.namespace_id(), Some(ns_id));
-    }
-
-    #[test]
-    fn test_namespace_id_available_in_joined() {
-        let ns_id = test_namespace_id();
-        let state = RoomState::start_joining("ticket".into());
-        let state = state.join("code".into(), test_topic_id(), ns_id);
-        assert_eq!(state.namespace_id(), Some(ns_id));
     }
 }
