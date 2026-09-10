@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-stream.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+hex.workspace = true
 iroh-docs.workspace = true
 iroh-gossip.workspace = true
 iroh-tickets.workspace = true
@@ -11,3 +16,8 @@ postcard.workspace = true
 rand.workspace = true
 serde.workspace = true
 sha2.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "sync"] }
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true

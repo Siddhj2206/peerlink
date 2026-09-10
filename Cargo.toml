@@ -8,6 +8,9 @@ edition = "2024"
 
 [workspace.dependencies]
 anyhow = "1"
+async-stream = "0.3"
+async-trait = "0.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 bytes = "1"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11"] }
 hex = "0.4.3"
@@ -19,11 +22,13 @@ iroh-tickets = "1"
 pollster = "1"
 postcard = { version = "1", features = ["alloc"] }
 rand = "0.10"
+reqwest = { version = "0.12", default-features = false }
 rfd = "0.17.2"
 rusty-codecs = { git = "https://github.com/n0-computer/iroh-live.git", default-features = false, features = ["h264"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.11"
 shiguredo_mp4 = "2026.3.0"
+tempfile = "3"
 tokio = "1.53.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
