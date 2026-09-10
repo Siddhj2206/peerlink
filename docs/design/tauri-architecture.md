@@ -63,7 +63,7 @@ peerlink/
 │  ├─ build.rs
 │  ├─ tauri.conf.json
 │  ├─ capabilities/default.json
-│  └─ src/{main.rs, lib.rs, commands.rs, events.rs, media_server.rs}
+│  └─ src/{main.rs, lib.rs, commands.rs, events.rs, model.rs, state.rs}
 └─ web/
    ├─ package.json  vite.config.ts  index.html
    └─ src/{main.tsx, App.tsx, party-client/, useParty.ts, views/{Home,Party}.tsx}
@@ -193,7 +193,7 @@ pub enum PartyEvent {
 
 ## 11. Rust ↔ JS contract
 
-The Tauri layer is a translation adapter: it owns the `Party` handle, the loopback server, and the event bridge — no domain state of its own.
+The Tauri layer is a translation adapter: it owns the event bridge and the managed state that keeps the loopback server (owned by `peerlink-core`) alive across commands — no domain state of its own.
 
 Commands: `create_room({mediaPath})`, `join_room({ticket, displayName})`, `leave_room()`, `play()`, `pause()`, `seek({positionMs})`, `send_chat({text})`, `get_state()`, `pick_media_file()` (via `tauri-plugin-dialog`).
 
